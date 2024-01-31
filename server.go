@@ -5,6 +5,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"sync"
 )
 
 type Message struct {
@@ -16,6 +17,7 @@ type Server struct {
 	listenAddr string
 	ln         net.Listener
 	clientMap  map[*net.Addr]net.Conn
+	sync.RWMutex
 
 	msgch  chan Message
 	quitch chan struct{}
@@ -26,6 +28,7 @@ func NewServer() *Server {
 		listenAddr: "localhost:5000",
 		msgch:      make(chan Message, 10),           // max 10 message in queue
 		clientMap:  make(map[*net.Addr]net.Conn, 10), // default support 10 client
+		RWMutex:    sync.RWMutex{},
 	}
 }
 
@@ -43,6 +46,7 @@ func (s *Server) Start() error {
 	s.ln = ln
 
 	go s.acceptLoop()
+	go s.broadcastLoop()
 
 	<-s.quitch
 
@@ -60,7 +64,12 @@ func (s *Server) acceptLoop() {
 		}
 
 		clientAddr := conn.RemoteAddr()
-		s.clientMap[&clientAddr] = conn
+
+		go func(*Server) {
+			s.RWMutex.Lock()
+			s.clientMap[&clientAddr] = conn
+			s.RWMutex.Unlock()
+		}(s)
 
 		go func(net.Addr) {
 			notification := fmt.Sprintf("connection accepted from %v \n", clientAddr.String())
@@ -68,7 +77,6 @@ func (s *Server) acceptLoop() {
 		}(clientAddr)
 
 		go s.readLoop(conn)
-		go s.broadcastLoop()
 	}
 }
 
@@ -77,7 +85,13 @@ func (s *Server) readLoop(conn net.Conn) {
 	clientAddr := conn.RemoteAddr()
 
 	defer func(net.Conn) {
-		conn.Close()
+		go conn.Close()
+
+		go func(*Server) {
+			s.RWMutex.Lock()
+			delete(s.clientMap, &clientAddr)
+			s.RWMutex.Unlock()
+		}(s)
 
 		go func(net.Addr) {
 			notification := fmt.Sprintf("connection lost from %v \n", clientAddr)
@@ -103,10 +117,7 @@ func (s *Server) readLoop(conn net.Conn) {
 		buf := buf[:n]
 
 		go func([]byte) {
-			bufCopy := make([]byte, n)
-			copy(bufCopy, buf)
-
-			s.broadcastMessage(clientAddr, bufCopy)
+			s.broadcastMessage(clientAddr, buf)
 		}(buf)
 
 	}
